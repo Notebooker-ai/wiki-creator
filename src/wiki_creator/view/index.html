@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wiki</title>
+<!--
+  wiki-creator view bundle. Self-contained (no external deps, no CDN) so it runs
+  in the host's sandboxed, opaque-origin iframe. The host posts the artifact in
+  via postMessage; this view dispatches on schema_id and renders. Display-only.
+
+  Two screens: a topic index and an article view. Articles are markdown rendered
+  by a small hand-written, escape-first subset renderer (headings, lists,
+  blockquotes, GFM tables, bold/italic/code, external links) extended with the
+  wiki's two inline forms: [^sN] footnote citations (anchored to the References
+  list derived from topic.sources) and [[Stem|anchor]] wikilinks (click-routed
+  navigation to other topics in the artifact — plain internal state, since
+  URL-fragment/history navigation can throw in the opaque-origin sandbox;
+  unresolvable links degrade to plain text).
+
+  Versioning lives here: keep a renderer for every schema_id this creator has
+  ever emitted. Today that is just wiki.v1.
+-->
+<style>
+  :root {
+    --bg: #ffffff; --fg: #18181b; --muted: #71717a; --card: #fafafa;
+    --border: #e4e4e7; --accent: #4f46e5; --accent-fg: #ffffff;
+  }
+  :root[data-theme="dark"] {
+    --bg: #18181b; --fg: #fafafa; --muted: #a1a1aa; --card: #27272a;
+    --border: #3f3f46; --accent: #6366f1; --accent-fg: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  a { color: var(--accent); }
+  h1.title { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+  .topic-list { list-style: none; margin: 0; padding: 0; }
+  .topic-list li { margin: 8px 0; }
+  .topic-card {
+    display: block; padding: 10px 14px; border-radius: 10px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--card); color: var(--fg);
+    text-decoration: none;
+  }
+  .topic-card:hover { border-color: var(--accent); }
+  .topic-card .name { font-weight: 600; color: var(--accent); }
+  .topic-card .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .back {
+    display: inline-block; margin-bottom: 12px; font-size: 13px;
+    color: var(--muted); cursor: pointer; text-decoration: none;
+  }
+  .back:hover { color: var(--accent); }
+  .article h2 { font-size: 17px; margin: 20px 0 8px; }
+  .article h3 { font-size: 15px; margin: 16px 0 6px; }
+  .article p { margin: 8px 0; }
+  .article ul, .article ol { margin: 8px 0; padding-left: 24px; }
+  .article li { margin: 3px 0; }
+  .article blockquote {
+    margin: 8px 0; padding: 4px 12px; color: var(--muted);
+    border-left: 3px solid var(--border);
+  }
+  .article code {
+    background: var(--card); border: 1px solid var(--border); border-radius: 4px;
+    padding: 1px 4px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .article pre {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .article pre code { background: none; border: none; padding: 0; }
+  .article table {
+    border-collapse: collapse; margin: 10px 0; width: 100%; font-size: 13px;
+  }
+  .article th, .article td {
+    border: 1px solid var(--border); padding: 6px 10px; text-align: left;
+    vertical-align: top;
+  }
+  .article th { background: var(--card); }
+  .wikilink {
+    color: var(--accent); cursor: pointer; text-decoration: none;
+    border-bottom: 1px dashed var(--accent);
+  }
+  sup.fnref { font-size: 11px; }
+  sup.fnref a { text-decoration: none; }
+  .refs { margin-top: 24px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .refs h2 { font-size: 15px; margin: 0 0 8px; }
+  .refs ol { margin: 0; padding-left: 22px; font-size: 13px; }
+  .refs li { margin: 4px 0; overflow-wrap: anywhere; }
+  .empty { color: var(--muted); padding: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="root"><div class="empty">Loading…</div></div>
+<script>
+(function () {
+  "use strict";
+  var root = document.getElementById("root");
+  var wiki = null; // current wiki.v1 data
+
+  var esc = function (s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  };
+
+  // ---- per-schema renderers (keep old versions forever) --------------------
+  var renderers = {
+    "wiki.v1": renderWikiV1,
+  };
+
+  // ---- topic lookup --------------------------------------------------------
+  function stemOf(filename) {
+    return String(filename || "").replace(/\.md$/i, "");
+  }
+
+  function findTopic(key) {
+    if (!wiki || !wiki.topics) return null;
+    var k = String(key || "").trim().toLowerCase();
+    for (var i = 0; i < wiki.topics.length; i++) {
+      var t = wiki.topics[i];
+      if ((t.slug || "").toLowerCase() === k) return t;
+      if (stemOf(t.filename).toLowerCase() === k) return t;
+      if ((t.name || "").toLowerCase() === k) return t;
+    }
+    return null;
+  }
+
+  // ---- inline markdown (input must already be HTML-escaped) ----------------
+  function safeUrl(url) {
+    return /^https?:\/\//i.test(url) ? url : null;
+  }
+
+  function renderInline(text, topic) {
+    var out = String(text);
+
+    // Protect code spans from further inline processing.
+    var codes = [];
+    out = out.replace(/`([^`]+)`/g, function (_, code) {
+      codes.push(code);
+      return "\u0000" + (codes.length - 1) + "\u0000";
+    });
+
+    // [[Stem]] / [[Stem|anchor]] wikilinks -> in-artifact navigation.
+    out = out.replace(/\[\[([^\]|]+?)(?:\|([^\]]+?))?\]\]/g, function (_, stem, anchor) {
+      var label = (anchor || stem).trim();
+      var target = findTopic(stem);
+      if (!target) return label;
+      return '<a class="wikilink" href="#topic=' + esc(encodeURIComponent(target.slug)) + '">' +
+             label + '</a>';
+    });
+
+    // [^sN] footnote refs -> superscript anchors into the References list.
+    out = out.replace(/\[\^([^\]\s]+)\]/g, function (m, marker) {
+      var n = 0;
+      var sources = (topic && topic.sources) || [];
+      for (var i = 0; i < sources.length; i++) {
+        if (sources[i].marker === marker) { n = i + 1; break; }
+      }
+      if (!n) return "";
+      return '<sup class="fnref"><a href="#ref-' + esc(marker) + '">[' + n + ']</a></sup>';
+    });
+
+    // [text](url) external links.
+    out = out.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, function (m, label, url) {
+      var u = safeUrl(url);
+      if (!u) return label;
+      return '<a href="' + esc(u) + '" target="_blank" rel="noopener">' + label + '</a>';
+    });
+
+    out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    out = out.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+
+    out = out.replace(/\u0000(\d+)\u0000/g, function (_, i) {
+      return "<code>" + codes[Number(i)] + "</code>";
+    });
+    return out;
+  }
+
+  // ---- block markdown ------------------------------------------------------
+  function isTableRow(line) {
+    var t = line.trim();
+    return t.length > 1 && t.charAt(0) === "|";
+  }
+
+  function isTableSeparator(line) {
+    return /^\s*\|?\s*:?-{2,}[\s|:-]*$/.test(line);
+  }
+
+  function splitRow(line) {
+    var t = line.trim().replace(/^\|/, "").replace(/\|\s*$/, "");
+    return t.split("|").map(function (c) { return c.trim(); });
+  }
+
+  function renderMarkdown(md, topic) {
+    var lines = String(md || "").replace(/\r\n/g, "\n").split("\n");
+    var html = [];
+    var para = [];
+    var list = null; // {tag: "ul"|"ol", items: []}
+    var i;
+
+    function flushPara() {
+      if (para.length) {
+        html.push("<p>" + renderInline(esc(para.join(" ")), topic) + "</p>");
+        para = [];
+      }
+    }
+    function flushList() {
+      if (list) {
+        html.push("<" + list.tag + ">" + list.items.map(function (it) {
+          return "<li>" + it + "</li>";
+        }).join("") + "</" + list.tag + ">");
+        list = null;
+      }
+    }
+    function flushAll() { flushPara(); flushList(); }
+
+    for (i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      var t = line.trim();
+
+      // Fenced code block.
+      if (/^```/.test(t)) {
+        flushAll();
+        var code = [];
+        i++;
+        while (i < lines.length && !/^```/.test(lines[i].trim())) {
+          code.push(lines[i]);
+          i++;
+        }
+        html.push("<pre><code>" + esc(code.join("\n")) + "</code></pre>");
+        continue;
+      }
+
+      // Table: a row line followed by a separator line.
+      if (isTableRow(t) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+        flushAll();
+        var head = splitRow(t);
+        var rows = [];
+        i += 2;
+        while (i < lines.length && isTableRow(lines[i].trim())) {
+          rows.push(splitRow(lines[i].trim()));
+          i++;
+        }
+        i--;
+        var thead = "<tr>" + head.map(function (c) {
+          return "<th>" + renderInline(esc(c), topic) + "</th>";
+        }).join("") + "</tr>";
+        var tbody = rows.map(function (r) {
+          return "<tr>" + r.map(function (c) {
+            return "<td>" + renderInline(esc(c), topic) + "</td>";
+          }).join("") + "</tr>";
+        }).join("");
+        html.push("<table><thead>" + thead + "</thead><tbody>" + tbody + "</tbody></table>");
+        continue;
+      }
+
+      var m;
+      if ((m = t.match(/^(#{1,6})\s+(.*)$/))) {
+        flushAll();
+        var level = Math.min(Math.max(m[1].length, 2), 4); // demote # to h2
+        html.push("<h" + level + ">" + renderInline(esc(m[2]), topic) + "</h" + level + ">");
+      } else if ((m = t.match(/^>\s?(.*)$/))) {
+        flushAll();
+        var quote = [m[1]];
+        while (i + 1 < lines.length && (m = lines[i + 1].trim().match(/^>\s?(.*)$/))) {
+          quote.push(m[1]);
+          i++;
+        }
+        html.push("<blockquote><p>" + renderInline(esc(quote.join(" ")), topic) + "</p></blockquote>");
+      } else if ((m = t.match(/^[-*]\s+(.*)$/))) {
+        flushPara();
+        if (!list || list.tag !== "ul") { flushList(); list = { tag: "ul", items: [] }; }
+        list.items.push(renderInline(esc(m[1]), topic));
+      } else if ((m = t.match(/^\d+[.)]\s+(.*)$/))) {
+        flushPara();
+        if (!list || list.tag !== "ol") { flushList(); list = { tag: "ol", items: [] }; }
+        list.items.push(renderInline(esc(m[1]), topic));
+      } else if (!t) {
+        flushAll();
+      } else {
+        flushList();
+        para.push(t);
+      }
+    }
+    flushAll();
+    return html.join("\n");
+  }
+
+  // ---- screens -------------------------------------------------------------
+  function renderIndex() {
+    var head =
+      '<h1 class="title">' + esc(wiki.title || "Wiki") + '</h1>' +
+      (wiki.description ? '<p class="subtitle">' + esc(wiki.description) + '</p>' : '');
+    var topics = wiki.topics || [];
+    if (!topics.length) {
+      root.innerHTML = head + '<div class="empty">This wiki has no articles.</div>';
+      return;
+    }
+    var items = topics.map(function (t) {
+      var meta = [];
+      if (t.summary) meta.push(esc(t.summary));
+      var n = (t.sources || []).length;
+      if (n) meta.push(n + (n === 1 ? " source" : " sources"));
+      return '<li><a class="topic-card" href="#topic=' + esc(encodeURIComponent(t.slug)) + '">' +
+             '<span class="name">' + esc(t.name) + '</span>' +
+             (meta.length ? '<div class="meta">' + meta.join(" · ") + '</div>' : '') +
+             '</a></li>';
+    }).join("");
+    root.innerHTML = head + '<ul class="topic-list">' + items + '</ul>';
+  }
+
+  function renderReferences(topic) {
+    var sources = topic.sources || [];
+    if (!sources.length) return "";
+    var items = sources.map(function (s) {
+      var label = esc(s.title || "Untitled");
+      var u = s.url ? safeUrl(s.url) : null;
+      var body = u
+        ? '<a href="' + esc(u) + '" target="_blank" rel="noopener">' + label + '</a>'
+        : label;
+      return '<li id="ref-' + esc(s.marker) + '">' + body + '</li>';
+    }).join("");
+    return '<div class="refs"><h2>References</h2><ol>' + items + '</ol></div>';
+  }
+
+  function renderTopic(topic) {
+    root.innerHTML =
+      '<a class="back" href="#">&larr; ' + esc(wiki.title || "Wiki") + '</a>' +
+      '<h1 class="title">' + esc(topic.name) + '</h1>' +
+      '<div class="article">' + renderMarkdown(topic.body_markdown, topic) + '</div>' +
+      renderReferences(topic);
+    try { window.scrollTo(0, 0); } catch (e) {}
+  }
+
+  // Navigation is plain internal state — never URL-fragment or history-API
+  // navigation, which can throw in the host's sandboxed opaque-origin iframe
+  // (no allow-same-origin).
+  var currentSlug = null;
+
+  function route() {
+    if (!wiki) return;
+    var topic = currentSlug ? findTopic(currentSlug) : null;
+    if (topic) renderTopic(topic);
+    else renderIndex();
+  }
+
+  function renderWikiV1(data) {
+    wiki = data || {};
+    currentSlug = null;
+    route();
+  }
+
+  // Delegated click handling: hrefs stay in the markup for semantics, but all
+  // in-artifact "#..." navigation is intercepted so the iframe URL never changes.
+  root.addEventListener("click", function (e) {
+    var a = e.target && e.target.closest ? e.target.closest("a") : null;
+    if (!a) return;
+    var href = a.getAttribute("href") || "";
+    if (href.indexOf("#topic=") === 0) {
+      e.preventDefault();
+      currentSlug = decodeURIComponent(href.slice(7));
+      route();
+    } else if (href === "#") {
+      e.preventDefault();
+      currentSlug = null;
+      route();
+    } else if (href.indexOf("#ref-") === 0) {
+      e.preventDefault();
+      var el = document.getElementById(href.slice(1));
+      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth" });
+    }
+    // external links (target=_blank) keep their default behavior
+  });
+
+  // ---- host handshake ------------------------------------------------------
+  function applyTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme === "dark" ? "dark" : "light");
+  }
+
+  // Resolve the effective light/dark theme from the posted message.
+  function resolveTheme(msg) {
+    var t = (msg.config && msg.config.theme) || (msg.data && msg.data.theme) || "auto";
+    if (t === "auto") t = msg.theme === "dark" ? "dark" : "light";
+    return t;
+  }
+
+  function onArtifact(msg) {
+    applyTheme(resolveTheme(msg));
+    var r = renderers[msg.schema_id];
+    if (!r) {
+      root.innerHTML = '<div class="empty">No renderer for "' + esc(msg.schema_id) + '".</div>';
+      return;
+    }
+    try { r(msg.data || {}); }
+    catch (e) { root.innerHTML = '<div class="empty">Failed to render this artifact.</div>'; }
+  }
+
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (d && d.type === "open-notebook:artifact") onArtifact(d);
+  });
+  // Tell the host we're listening; it (re)posts the artifact in response.
+  try { parent.postMessage({ type: "open-notebook:ready" }, "*"); } catch (e) {}
+})();
+</script>
+</body>
+</html>

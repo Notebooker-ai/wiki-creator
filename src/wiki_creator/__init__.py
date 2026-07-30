@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from . import export, markup, pipeline
 from .bundle import SourceBlock, parse_bundle
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _TOPIC_CONCURRENCY = 3
 
@@ -90,7 +90,10 @@ class WikiCreator(BaseCreator):
                     description="LLM that extracts topics and writes the articles.",
                 )
             ],
-            icon="book-open",
+            # NOT "book-open": textbook-creator already declares that, and the
+            # host icon maps key off this name, so the two would render
+            # identically side by side in the creator list.
+            icon="library-big",
             view=CreatorView(entry="view/index.html"),
         )
 

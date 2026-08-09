@@ -95,6 +95,10 @@ class WikiCreator(BaseCreator):
             # identically side by side in the creator list.
             icon="library-big",
             view=CreatorView(entry="view/index.html"),
+            suggestion_hint=(
+                "how to split the content into interlinked articles, which topics "
+                "deserve their own page, and how deep each should go"
+            ),
         )
 
     async def generate(self, request: CreationRequest) -> CreationResult:

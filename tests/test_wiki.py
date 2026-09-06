@@ -7,7 +7,13 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from open_notebook_creator_sdk import ContentBundle, CreationRequest, ModelRole
+from open_notebook_creator_sdk import (
+    ContentBundle,
+    CreationRequest,
+    ModelRole,
+    RenderRequest,
+    SourceDoc,
+)
 from open_notebook_creator_sdk.testing import (
     assert_creator_compliant,
     assert_result_compliant,
@@ -127,7 +133,7 @@ async def test_files_emitted(tmp_path: Path):
     creator = WikiCreator()
     result = await creator.generate(_request(str(tmp_path)))
 
-    names = [f.filename for f in result.files]
+    names = [f.filename for f in result.files if f.role == "output"]
     assert names[0] == "My Wiki.zip"
     assert set(names[1:]) == {"Rosé Wine.md", "Dive Bars.md", "Wiki Index.md"}
 
@@ -222,3 +228,155 @@ async def test_partial_when_one_topic_produces_nothing():
         assert result.status == "PARTIAL"
         assert [t["name"] for t in result.data["topics"]] == ["Rosé Wine"]
         assert result.warnings
+
+
+# --- editable source + render ---------------------------------------------
+
+
+def _render_request(td: str, data: dict, sources: list) -> RenderRequest:
+    return RenderRequest(
+        sources=[
+            SourceDoc(filename=name, content_type="text/markdown", content=body)
+            for name, body in sources
+        ],
+        config={},
+        data=data,
+        output_dir=td,
+        artifact_id="a",
+    )
+
+
+def test_manifest_declares_editable_source():
+    assert WikiCreator().manifest.editable_source is True
+
+
+async def test_generate_emits_one_source_file_per_topic(tmp_path: Path):
+    creator = WikiCreator()
+    result = await creator.generate(_request(str(tmp_path)))
+    assert_result_compliant(creator, result)
+
+    sources = [f for f in result.files if f.role == "source"]
+    assert [f.filename for f in sources] == ["source/Rosé Wine.md", "source/Dive Bars.md"]
+    assert all(f.path == f.filename for f in sources)
+    assert all(f.content_type == "text/markdown" for f in sources)
+    assert [f.label for f in sources] == ["Rosé Wine", "Dive Bars"]
+
+    # The source is exactly the raw editable body: no front matter, no References.
+    rose = result.data["topics"][0]
+    on_disk = (tmp_path / "source" / "Rosé Wine.md").read_text(encoding="utf-8")
+    assert on_disk == rose["body_markdown"]
+    assert not on_disk.startswith("---")
+    assert "## References" not in on_disk
+
+    # Every export file is still a plain output, and the zip holds only outputs.
+    outputs = [f for f in result.files if f.role == "output"]
+    assert {f.filename for f in outputs} == {
+        "My Wiki.zip", "Rosé Wine.md", "Dive Bars.md", "Wiki Index.md"
+    }
+    with zipfile.ZipFile(tmp_path / "My Wiki.zip") as zf:
+        assert not any(n.startswith("source/") for n in zf.namelist())
+
+
+async def test_render_applies_edited_body_and_rebuilds_exports(tmp_path: Path):
+    creator = WikiCreator()
+    generated = await creator.generate(_request(str(tmp_path)))
+    edited = "Rosé is EDITED by hand.[^s1] Still pairs with [[Dive Bars]].\n\n"
+
+    result = await creator.render(
+        _render_request(
+            str(tmp_path), generated.data, [("source/Rosé Wine.md", edited)]
+        )
+    )
+    assert result.status == "SUCCESS"
+    assert result.schema_id == "wiki.v1"
+    assert_result_compliant(creator, result)
+
+    rose = result.data["topics"][0]
+    assert rose["body_markdown"] == edited.rstrip()
+    assert rose["summary"].startswith("Rosé is EDITED by hand")
+    # Unchanged metadata carried forward from the previous data.
+    assert result.data["title"] == "My Wiki"
+    assert rose["slug"] == "rose-wine"
+    assert rose["filename"] == "Rosé Wine.md"
+    assert [s["marker"] for s in rose["sources"]] == ["s1"]
+
+    # The exported topic file was regenerated from the edit and still carries
+    # the derived front matter + References block.
+    rose_md = (tmp_path / "Rosé Wine.md").read_text(encoding="utf-8")
+    assert rose_md.startswith('---\ntitle: "Rosé Wine"\n')
+    assert "Rosé is EDITED by hand.[^s1]" in rose_md
+    assert "[^s1]: [Bandol thread](https://example.com/bandol)" in rose_md
+    with zipfile.ZipFile(tmp_path / "My Wiki.zip") as zf:
+        assert "EDITED" in zf.read("Rosé Wine.md").decode("utf-8")
+    # The index note reflects the recomputed summary.
+    assert "Rosé is EDITED by hand" in (tmp_path / "Wiki Index.md").read_text()
+
+    # Full file set: every export output plus the re-declared sources.
+    names = [f.filename for f in result.files]
+    assert names[0] == "My Wiki.zip"
+    assert set(names) == {
+        "My Wiki.zip", "Rosé Wine.md", "Dive Bars.md", "Wiki Index.md",
+        "source/Rosé Wine.md", "source/Dive Bars.md",
+    }
+    sources = {f.filename: f for f in result.files if f.role == "source"}
+    assert set(sources) == {"source/Rosé Wine.md", "source/Dive Bars.md"}
+    assert sources["source/Rosé Wine.md"].label == "Rosé Wine"
+    assert (tmp_path / "source" / "Rosé Wine.md").read_text() == edited.rstrip()
+
+
+async def test_render_leaves_untouched_topics_unchanged(tmp_path: Path):
+    creator = WikiCreator()
+    generated = await creator.generate(_request(str(tmp_path)))
+    before = generated.data["topics"][1]
+    bars_md_before = (tmp_path / "Dive Bars.md").read_text(encoding="utf-8")
+
+    result = await creator.render(
+        _render_request(
+            str(tmp_path), generated.data, [("source/Rosé Wine.md", "Changed.[^s1]")]
+        )
+    )
+    assert result.data["topics"][1] == before
+    assert (tmp_path / "Dive Bars.md").read_text(encoding="utf-8") == bars_md_before
+    assert (tmp_path / "source" / "Dive Bars.md").read_text() == before["body_markdown"]
+
+
+async def test_render_with_no_matching_sources_keeps_previous_bodies(tmp_path: Path):
+    creator = WikiCreator()
+    generated = await creator.generate(_request(str(tmp_path)))
+
+    result = await creator.render(
+        _render_request(
+            str(tmp_path), generated.data, [("source/Nope.md", "stray edit")]
+        )
+    )
+    assert result.status == "SUCCESS"
+    assert result.data["topics"] == generated.data["topics"]
+    assert result.warnings and "source/Nope.md" in result.warnings[0]
+    assert {f.filename for f in result.files} == {f.filename for f in generated.files}
+
+    empty = await creator.render(_render_request(str(tmp_path), generated.data, []))
+    assert empty.status == "SUCCESS"
+    assert empty.data == generated.data
+    assert not empty.warnings
+
+
+async def test_render_reresolves_wikilinks_against_existing_topics(tmp_path: Path):
+    creator = WikiCreator()
+    generated = await creator.generate(_request(str(tmp_path)))
+    edited = (
+        "Go to [[dive bars|the bars]] or [[Dive Bars]]; see [[Rosé Wine]] "
+        "and [[Brand New Topic]].[^s1]"
+    )
+
+    result = await creator.render(
+        _render_request(
+            str(tmp_path), generated.data, [("source/Rosé Wine.md", edited)]
+        )
+    )
+    body = result.data["topics"][0]["body_markdown"]
+    # Case-insensitive name/stem matches canonicalise to the target stem…
+    assert "[[Dive Bars|the bars]]" in body
+    assert "[[Dive Bars]]" in body
+    # …a self-link and an unknown link are left as the user wrote them.
+    assert "[[Rosé Wine]]" in body
+    assert "[[Brand New Topic]]" in body

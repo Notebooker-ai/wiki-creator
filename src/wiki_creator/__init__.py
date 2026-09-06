@@ -1,6 +1,11 @@
 """wiki-creator: an Open Notebook creator that distills a notebook's sources
 into a set of interlinked, Wikipedia-style topic articles (emitted as
 ``wiki.v1``) and exports them as Obsidian-ready markdown files plus a vault zip.
+
+Each topic's raw article body is also attached as an editable ``role="source"``
+file (``source/<Topic>.md``) so the host can offer "edit → re-render":
+:meth:`WikiCreator.render` folds the edited bodies back into the previous
+``wiki.v1`` data and rebuilds the exports without touching an LLM.
 """
 
 from __future__ import annotations
@@ -8,17 +13,19 @@ from __future__ import annotations
 import asyncio
 import datetime
 from pathlib import Path
-from typing import ClassVar, Dict, List, Literal, Optional
+from typing import Callable, ClassVar, Dict, List, Literal, Optional
 
 from loguru import logger
 from open_notebook_creator_sdk import (
     BaseCreator,
     CreationError,
+    CreationFile,
     CreationRequest,
     CreationResult,
     CreatorManifest,
     CreatorView,
     ModelRoleSpec,
+    RenderRequest,
 )
 from open_notebook_creator_sdk.schemas import WikiSourceRefV1, WikiTopicV1, WikiV1
 from pydantic import BaseModel, Field
@@ -29,6 +36,8 @@ from .bundle import SourceBlock, parse_bundle
 __version__ = "0.2.0"
 
 _TOPIC_CONCURRENCY = 3
+#: Subdirectory of ``output_dir`` holding one editable source file per topic.
+SOURCE_DIR = "source"
 
 
 class WikiConfig(BaseModel):
@@ -67,6 +76,50 @@ def _unique_slugs(names: List[str]) -> List[str]:
     return slugs
 
 
+def _source_files(output_dir: Path, wiki: WikiV1) -> List[CreationFile]:
+    """Write each topic's raw ``body_markdown`` (no front matter, no References
+    block — the editable text) to ``output_dir/source/<topic.filename>`` and
+    declare it as a ``role="source"`` file.
+
+    Topic filenames are already unique within the wiki (``dedupe_stems``), so
+    the source paths are too.
+    """
+    (output_dir / SOURCE_DIR).mkdir(parents=True, exist_ok=True)
+    files: List[CreationFile] = []
+    for topic in wiki.topics:
+        rel = f"{SOURCE_DIR}/{topic.filename}"
+        (output_dir / rel).write_text(topic.body_markdown, encoding="utf-8")
+        files.append(
+            CreationFile(
+                filename=rel,
+                content_type="text/markdown",
+                path=rel,
+                role="source",
+                label=topic.name,
+            )
+        )
+    return files
+
+
+def _render_link_resolver(wiki: WikiV1) -> Callable[[str], Optional[str]]:
+    """Resolver for wikilinks in a hand-edited body: a link whose title matches
+    an existing topic's name or filename stem (case-insensitively) is
+    canonicalised to that stem; anything else — including self-links — is left
+    exactly as the user wrote it (generate-time drop-on-unknown would destroy
+    deliberate edits)."""
+    stem_by_key: Dict[str, str] = {}
+    for topic in wiki.topics:
+        stem = Path(topic.filename).stem
+        stem_by_key.setdefault(stem.lower(), stem)
+        stem_by_key.setdefault(topic.name.strip().lower(), stem)
+
+    def _resolve(title: str) -> Optional[str]:
+        title = title.strip()
+        return stem_by_key.get(title.lower(), title)
+
+    return _resolve
+
+
 class WikiCreator(BaseCreator):
     config_model: ClassVar[type] = WikiConfig
 
@@ -99,6 +152,7 @@ class WikiCreator(BaseCreator):
                 "how to split the content into interlinked articles, which topics "
                 "deserve their own page, and how deep each should go"
             ),
+            editable_source=True,
         )
 
     async def generate(self, request: CreationRequest) -> CreationResult:
@@ -235,9 +289,9 @@ class WikiCreator(BaseCreator):
             topics=topics,
             index_filename=index_filename,
         )
-        files = export.write_files(
-            Path(request.output_dir), wiki, datetime.date.today()
-        )
+        output_dir = Path(request.output_dir)
+        files = export.write_files(output_dir, wiki, datetime.date.today())
+        files += _source_files(output_dir, wiki)
 
         skipped = len(plan.topics) - len(realized)
         return CreationResult(
@@ -251,4 +305,66 @@ class WikiCreator(BaseCreator):
                 if skipped
                 else None
             ),
+        )
+
+    async def render(self, request: RenderRequest) -> CreationResult:
+        """Rebuild the wiki from user-edited topic bodies. Deterministic: no LLM.
+
+        Each ``source/<topic.filename>`` document replaces that topic's
+        ``body_markdown`` (trailing whitespace stripped, wikilinks re-resolved
+        against the existing topics, summary recomputed from the new lede).
+        Topics without a matching source keep their previous body; sources that
+        match no topic are ignored with a warning. Everything else in the
+        previous data (title, slugs, filenames, citation sources) is carried
+        forward, then the ``.md`` exports and vault zip are rewritten.
+        """
+        prev = WikiV1.model_validate(request.data)
+        edits = {doc.filename: doc.content for doc in request.sources}
+        known = {f"{SOURCE_DIR}/{t.filename}" for t in prev.topics}
+        warnings = [
+            f"Ignored source file '{name}': it does not match any wiki topic."
+            for name in edits
+            if name not in known
+        ]
+
+        resolve = _render_link_resolver(prev)
+        topics: List[WikiTopicV1] = []
+        for topic in prev.topics:
+            edited = edits.get(f"{SOURCE_DIR}/{topic.filename}")
+            if edited is None:
+                topics.append(topic)
+                continue
+            body = markup.rewrite_wikilinks(edited, resolve).rstrip()
+            topics.append(
+                topic.model_copy(
+                    update={"body_markdown": body, "summary": pipeline._lede(body) or None}
+                )
+            )
+
+        wiki = WikiV1(
+            title=prev.title,
+            description=prev.description,
+            topics=topics,
+            index_filename=prev.index_filename,
+        )
+        output_dir = Path(request.output_dir)
+        try:
+            files = export.write_files(output_dir, wiki, datetime.date.today())
+            files += _source_files(output_dir, wiki)
+        except OSError as e:
+            logger.error(f"wikis: render failed to write files: {e}")
+            return CreationResult(
+                status="FAILURE",
+                schema_id="wiki.v1",
+                data=prev.model_dump(),
+                errors=[CreationError(phase="render", message=str(e))],
+                user_message="The wiki files could not be rewritten.",
+            )
+
+        return CreationResult(
+            status="SUCCESS",
+            schema_id="wiki.v1",
+            data=wiki.model_dump(),
+            files=files,
+            warnings=warnings,
         )

@@ -1,12 +1,12 @@
 [project]
 name = "wiki-creator"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 description = "Open Notebook creator: interlinked topic articles with citations, exported as Obsidian-ready markdown (wiki.v1)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "open-notebook-creator-sdk>=0.11",
+    "open-notebook-creator-sdk>=0.12",
     "esperanto>=2.19",
     "ai-prompter>=0.3.1",
     "langchain-core>=0.3",

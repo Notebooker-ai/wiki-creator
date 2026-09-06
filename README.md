@@ -23,6 +23,15 @@ The artifact's `data` carries the full article set, rendered in-app by the
 self-contained `view/index.html` bundle (topic index → article pages with
 navigable wikilinks). Display-only; no host API access.
 
+## Editing after generation
+
+Each topic's raw article body is also attached as an editable
+`role="source"` file (`source/<Topic>.md` — just the markdown, no front
+matter or References block). The host can hand edited bodies back through
+`render()`, which folds them into the previous `wiki.v1` data (recomputing
+each edited topic's summary and re-resolving `[[wikilinks]]` against the
+existing topics) and rewrites the `.md` exports and vault zip — no LLM call.
+
 ## Development
 
 ```bash

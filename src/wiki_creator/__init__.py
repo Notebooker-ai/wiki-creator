@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from . import export, markup, pipeline
 from .bundle import SourceBlock, parse_bundle
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 _TOPIC_CONCURRENCY = 3
 #: Subdirectory of ``output_dir`` holding one editable source file per topic.
@@ -214,7 +214,8 @@ class WikiCreator(BaseCreator):
             async with semaphore:
                 try:
                     body = await pipeline.synthesize_topic(
-                        role, topic.name, topic_blocks, other, cfg.article_length
+                        role, topic.name, topic_blocks, other, cfg.article_length,
+                        instructions=request.instructions, language=request.language
                     )
                 except Exception as e:  # noqa: BLE001 - one topic must not sink the wiki
                     logger.error(f"wikis: synthesis failed for '{topic.name}': {e}")

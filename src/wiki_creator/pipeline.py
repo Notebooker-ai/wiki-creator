@@ -212,12 +212,14 @@ async def _summarize_batch(
     topic: str,
     blocks: List[str],
     semaphore: asyncio.Semaphore,
+    instructions: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> str:
     """MAP step: distill one batch of source blocks into dense, specific notes that
     PRESERVE the ``[[cite:sN]]`` markers, so the reduce step can cite them."""
     async with semaphore:
         prompt = _render_prompt(
-            "topic_batch_notes.jinja", {"topic": topic, "sources": "\n\n".join(blocks)}
+            "topic_batch_notes.jinja", {"topic": topic, "sources": "\n\n".join(blocks), "instructions": instructions, "language": language}
         )
         llm = role.create_language(max_tokens=BATCH_NOTES_MAX_TOKENS)
         resp = await llm.ainvoke(prompt)
@@ -230,6 +232,8 @@ async def synthesize_topic(
     blocks: List[SourceBlock],
     other_topics: List[str],
     article_length: str = "standard",
+    instructions: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> str:
     """Stage 2: write one topic article summarizing ALL its sources, citing them
     inline as ``[[cite:sN]]`` and cross-linking other wiki topics as
@@ -250,7 +254,7 @@ async def synthesize_topic(
     if len(combined) <= BATCH_CHAR_BUDGET:
         prompt = _render_prompt(
             "topic_article.jinja",
-            {"topic": topic, "sources": combined, "other_topics": other},
+            {"topic": topic, "sources": combined, "other_topics": other, "instructions": instructions, "language": language},
         )
         llm = role.create_language(max_tokens=article_max_tokens)
         resp = await llm.ainvoke(prompt)
@@ -261,7 +265,7 @@ async def synthesize_topic(
     semaphore = asyncio.Semaphore(_BATCH_CONCURRENCY)
     batches = _batch_blocks(labeled)
     notes = await asyncio.gather(
-        *[_summarize_batch(role, topic, batch, semaphore) for batch in batches]
+        *[_summarize_batch(role, topic, batch, semaphore, instructions, language) for batch in batches]
     )
     note_blocks = [
         f"## Source group {i + 1}\n{n}" for i, n in enumerate(notes) if n and n.strip()
@@ -275,7 +279,7 @@ async def synthesize_topic(
     while len("\n\n".join(note_blocks)) > BATCH_CHAR_BUDGET and len(note_blocks) > 1:
         folded = await asyncio.gather(
             *[
-                _summarize_batch(role, topic, batch, semaphore)
+                _summarize_batch(role, topic, batch, semaphore, instructions, language)
                 for batch in _batch_blocks(note_blocks)
             ]
         )
@@ -285,7 +289,7 @@ async def synthesize_topic(
 
     prompt = _render_prompt(
         "topic_reduce.jinja",
-        {"topic": topic, "notes": "\n\n".join(note_blocks), "other_topics": other},
+        {"topic": topic, "notes": "\n\n".join(note_blocks), "other_topics": other, "instructions": instructions, "language": language},
     )
     llm = role.create_language(max_tokens=REDUCE_MAX_TOKENS)
     resp = await llm.ainvoke(prompt)

@@ -85,3 +85,16 @@ async def test_large_topic_map_reduces():
     # Two map calls (one per batch) + one reduce call.
     assert len(calls) == 3
     assert "BEGIN NOTES" in calls[-1]
+
+
+async def test_user_requirements_and_language_reach_direct_and_map_reduce_writing():
+    requirement = "Explain that 6, 9, and 10 out of 12 are fictional, not research findings."
+    for blocks in [[_block("s1", "Short source")], [_block("s1", "x" * 35000), _block("s2", "y" * 35000)]]:
+        calls = []
+        class Role:
+            def create_language(self, **kwargs):
+                return _CountingLLM(calls, "Grounded notes [[cite:s1]]")
+        await pipeline.synthesize_topic(Role(), "Retrieval", blocks, [], instructions=requirement, language="Spanish")
+        assert calls
+        assert all(requirement in prompt for prompt in calls)
+        assert all("Spanish" in prompt for prompt in calls)

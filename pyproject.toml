@@ -1,6 +1,6 @@
 [project]
 name = "wiki-creator"
-version = "0.2.0"
+version = "0.2.1"
 license = "MIT"
 description = "Open Notebook creator: interlinked topic articles with citations, exported as Obsidian-ready markdown (wiki.v1)"
 readme = "README.md"
